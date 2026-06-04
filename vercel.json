@@ -1,6 +1,6 @@
 {
-    "rewrites": [
-      { "source": "/(.*)", "destination": "/" }
-    ]
+  "functions": {
+    "api/scrape.js": { "maxDuration": 60 },
+    "api/chat.js": { "maxDuration": 30 }
   }
-  
+}

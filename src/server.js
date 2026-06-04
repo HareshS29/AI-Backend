@@ -1,118 +1,114 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const cheerio = require('cheerio');
-const fetch = require('node-fetch');
-const { GoogleGenAI } = require("@google/genai");
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const crypto = require('crypto');
 
-// ── REDIS SETUP (supports both local and Redis Cloud) ──────────────────────────
-// For Vercel: set REDIS_URL in environment variables to your Redis Cloud URL
-// Redis Cloud free tier: https://redis.io/try-free/
-// Format: redis://default:<password>@<host>:<port>
-const redis = require('redis');
-const redisClient = redis.createClient({
-  url: process.env.REDIS_URL || 'redis://127.0.0.1:6379',
-  socket: {
-    reconnectStrategy: (retries) => {
-      if (retries > 3) {
-        console.warn('Redis unavailable, falling back to in-memory cache');
-        return false;
-      }
-      return Math.min(retries * 100, 3000);
-    }
-  }
-});
-
+// ── REDIS SETUP ───────────────────────────────────────────────────────────────
+// Redis is optional. Only connects if REDIS_URL is explicitly set in .env.
+// Without it the server falls back to in-memory cache automatically.
+// To enable locally: add REDIS_URL=redis://127.0.0.1:6379 to your .env
+let redisClient = null;
 let redisAvailable = false;
-redisClient.connect()
-  .then(() => { redisAvailable = true; console.log('Redis connected'); })
-  .catch(() => { redisAvailable = false; console.warn('Redis not available, using in-memory cache fallback'); });
 
-// ── IN-MEMORY CACHE FALLBACK (used when Redis is unavailable) ─────────────────
-// This ensures the server works on Vercel even without Redis configured yet
+if (process.env.REDIS_URL) {
+  const redis = require('redis');
+  redisClient = redis.createClient({
+    url: process.env.REDIS_URL,
+    socket: {
+      reconnectStrategy: (retries) => {
+        if (retries > 3) { console.warn('Redis unavailable, falling back to in-memory cache'); return false; }
+        return Math.min(retries * 100, 3000);
+      }
+    }
+  });
+  redisClient.connect()
+    .then(() => { redisAvailable = true; console.log('Redis connected'); })
+    .catch(() => { redisAvailable = false; console.warn('Redis not available, using in-memory cache fallback'); });
+} else {
+  console.log('No REDIS_URL set — using in-memory cache.');
+}
+
+// ── IN-MEMORY CACHE FALLBACK ──────────────────────────────────────────────────
 const memoryCache = new Map();
-const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+const CACHE_TTL = 24 * 60 * 60 * 1000;
+const ONE_HOUR = 60 * 60 * 1000;
+
+// Content version tied to lastFetched so cached AI responses are invalidated
+// automatically when the scraped website content is refreshed.
+function getContentVersion() {
+  return lastFetched ? Math.floor(lastFetched / ONE_HOUR) : 0;
+}
 
 async function getCachedResponse(prompt) {
-  const hash = crypto.createHash('sha256').update(prompt.toLowerCase().trim()).digest('hex');
+  const hash = crypto.createHash('sha256')
+    .update(`${prompt.toLowerCase().trim()}:${getContentVersion()}`)
+    .digest('hex');
   const key = `cache:${hash}`;
-
   if (redisAvailable) {
     try {
       const cached = await redisClient.get(key);
       return cached ? JSON.parse(cached) : null;
-    } catch { /* fall through to memory cache */ }
+    } catch { /* fall through */ }
   }
-
-  // Memory cache fallback
   const entry = memoryCache.get(key);
   if (entry && Date.now() - entry.timestamp < CACHE_TTL) return entry.value;
   return null;
 }
 
 async function setCachedResponse(prompt, responseText) {
-  const hash = crypto.createHash('sha256').update(prompt.toLowerCase().trim()).digest('hex');
+  const hash = crypto.createHash('sha256')
+    .update(`${prompt.toLowerCase().trim()}:${getContentVersion()}`)
+    .digest('hex');
   const key = `cache:${hash}`;
-
   if (redisAvailable) {
-    try {
-      await redisClient.setEx(key, 86400, JSON.stringify(responseText));
-      return;
-    } catch { /* fall through to memory cache */ }
+    try { await redisClient.setEx(key, 86400, JSON.stringify(responseText)); return; } catch { /* fall through */ }
   }
-
-  // Memory cache fallback
   memoryCache.set(key, { value: responseText, timestamp: Date.now() });
-
-  // Prevent memory leak — limit to 500 cached entries
-  if (memoryCache.size > 500) {
-    const firstKey = memoryCache.keys().next().value;
-    memoryCache.delete(firstKey);
-  }
+  if (memoryCache.size > 500) memoryCache.delete(memoryCache.keys().next().value);
 }
 
-// ── BULLMQ QUEUE (only used when Redis is available) ──────────────────────────
+// ── BULLMQ QUEUE (only when Redis available) ──────────────────────────────────
 let chatQueue = null;
 let chatQueueEvents = null;
-let chatWorker = null;
 
 if (process.env.REDIS_URL) {
   const { Queue, Worker, QueueEvents } = require('bullmq');
   const redisConnection = { url: process.env.REDIS_URL };
-
   chatQueue = new Queue('chatQueue', { connection: redisConnection });
   chatQueueEvents = new QueueEvents('chatQueue', { connection: redisConnection });
-
-  chatWorker = new Worker('chatQueue', async job => {
-    const { messages, systemInstruction } = job.data;
-    return await callGeminiDirect(messages, systemInstruction);
+  new Worker('chatQueue', async job => {
+    return await callAI(job.data.messages, job.data.systemInstruction, job.data.websiteContent, job.data.model);
   }, { connection: redisConnection, concurrency: 5 });
 }
 
-// ── RATE LIMITING (in-memory, works on Vercel without Redis) ──────────────────
+// ── RATE LIMITING ─────────────────────────────────────────────────────────────
 const rateLimit = require('express-rate-limit');
-const rateLimitStore = new Map();
-
 const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 10,
+  windowMs: 60 * 1000, max: 10,
   message: { error: 'Too many requests, please try again in a minute.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-  // Uses built-in memory store — works without Redis on Vercel
+  standardHeaders: true, legacyHeaders: false,
 });
 
-// ── PARALLEL REQUEST PREVENTION (in-memory) ───────────────────────────────────
+// ── PARALLEL REQUEST PREVENTION ───────────────────────────────────────────────
 const activeLocks = new Map();
-
 const preventParallelRequests = (req, res, next) => {
   const userId = req.ip;
-  if (activeLocks.get(userId)) {
-    return res.status(429).json({ error: 'Please wait for your previous request to finish.' });
-  }
+  if (activeLocks.get(userId)) return res.status(429).json({ error: 'Please wait for your previous request to finish.' });
   activeLocks.set(userId, true);
   res.on('finish', () => activeLocks.delete(userId));
+  next();
+};
+
+// ── ADMIN AUTH ────────────────────────────────────────────────────────────────
+// Add ADMIN_TOKEN=your-secret to your .env file.
+// Pass it as the x-admin-token header when calling /clear-cache or /test-scrape.
+const adminAuth = (req, res, next) => {
+  const token = req.headers['x-admin-token'];
+  if (!token || token !== process.env.ADMIN_TOKEN) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
   next();
 };
 
@@ -122,182 +118,163 @@ app.use(cors());
 app.use(express.json());
 
 // ── COMPANY PAGES TO SCRAPE ───────────────────────────────────────────────────
+// Add all 26 pages here. Concurrency-limited scraping means adding more pages
+// won't crash the server — it just adds more rounds at 4 pages at a time.
 const COMPANY_PAGES = [
-  // VDart Main Website
   "https://vdart.com",
-  "https://vdart.com/about",
+  "https://www.vdart.com/services/digital-talent-management/",
   "https://vdart.com/services",
   "https://vdart.com/careers",
-  "https://vdart.com/contact",
-
-  // VDart Digital
-  "https://www.vdartdigital.com/",
-  "https://www.vdartdigital.com/ai-agentic-ai-services/",
-  "https://www.vdartdigital.com/data-analytics/",
-  "https://www.vdartdigital.com/cloud-services/",
-  "https://www.vdartdigital.com/managed-services/",
-  "https://www.vdartdigital.com/cybersecurity/",
-  "https://www.vdartdigital.com/digital-services/",
-  "https://www.vdartdigital.com/blockchain/",
-  "https://www.vdartdigital.com/enterprise-saas-solutions/",
-  "https://www.vdartdigital.com/quality-engineering/",
-  "https://www.vdartdigital.com/supply-chain/#3",
-  "https://www.vdartdigital.com/supply-chain/#1",
-  "https://www.vdartdigital.com/supply-chain/#2",
-  "https://www.vdartdigital.com/supply-chain/#4",
-  "https://www.vdartdigital.com/data-analytics/ai-nlp/",
-  "https://www.vdartdigital.com/data-analytics/computer-vision/",
-  "https://www.vdartdigital.com/data-analytics/speech/",
-  "https://www.vdartdigital.com/data-analytics/ml-mlops/",
-  "https://www.vdartdigital.com/data-analytics/internet-of-things-iot/",
-  "https://www.vdartdigital.com/data-analytics/data-science/",
-  "https://www.vdartdigital.com/data-analytics/analytics/",
-  "https://www.vdartdigital.com/data-analytics/reports/",
-  "https://www.vdartdigital.com/data-analytics/big-data-data-lake/",
-  "https://www.vdartdigital.com/data-analytics/data-fabric/",
-  "https://www.vdartdigital.com/cloud-services/cloud-migration/",
-  "https://www.vdartdigital.com/cloud-services/mainframe-modernization/",
-  "https://www.vdartdigital.com/cloud-services/sap-on-cloud/",
-  "https://www.vdartdigital.com/cloud-services/cloud-security/",
-  "https://www.vdartdigital.com/cloud-services/cloud-finops/",
-  "https://www.vdartdigital.com/cloud-services/platform-engineering/",
-  "https://www.vdartdigital.com/cloud-services/cloud-managed-services/",
-  "https://www.vdartdigital.com/cloud-services/cloud-advisory-sme-services/",
-  "https://www.vdartdigital.com/managed-services/network-security-management/",
-  "https://www.vdartdigital.com/managed-services/strategic-it-consulting-continuous-improvement",
-  "https://www.vdartdigital.com/managed-services/infrastructure-data-center-management/",
-  "https://www.vdartdigital.com/managed-services/end-user-support-device/",
-  "https://www.vdartdigital.com/managed-services/cloud-application-management/",
-  "https://www.vdartdigital.com/managed-services/it-operations-service-management/",
-  "https://www.vdartdigital.com/cybersecurity/ciam/",
-  "https://www.vdartdigital.com/cybersecurity/workforce-identity/",
-  "https://www.vdartdigital.com/cybersecurity/security-engineering/",
-  "https://www.vdartdigital.com/cybersecurity/zero-trust-architecture/",
-  "https://www.vdartdigital.com/cybersecurity/governance-risk-management-compliance/",
-  "https://www.vdartdigital.com/cybersecurity/cyber-defense-investigations/",
-  "https://www.vdartdigital.com/cybersecurity/cyber-advisory/",
-  "https://www.vdartdigital.com/cybersecurity/cyber-resilience/",
-  "https://www.vdartdigital.com/digital-services/full-stack-web-development/",
-  "https://www.vdartdigital.com/digital-services/mobile-app-development/",
-  "https://www.vdartdigital.com/digital-services/apps-support-maintenance/",
-  "https://www.vdartdigital.com/digital-services/hyperautomation/",
-  "https://www.vdartdigital.com/digital-services/devsecops-automation/",
-  "https://www.vdartdigital.com/digital-services/sre-chaos-engineering/",
-  "https://www.vdartdigital.com/digital-services/ui-ux-front-end-development/",
-  "https://www.vdartdigital.com/digital-services/quality-engineering-assurance/",
-  "https://www.vdartdigital.com/digital-services/design-architecture/",
-  "https://www.vdartdigital.com/digital-services/back-end-development/",
-  "https://www.vdartdigital.com/blockchain/distributed-trust/",
-  "https://www.vdartdigital.com/blockchain/ethereum/",
-  "https://www.vdartdigital.com/blockchain/hyperledger/",
-  "https://www.vdartdigital.com/blockchain/decentralized-applications-dapps/",
-  "https://www.vdartdigital.com/blockchain/nft/",
-  "https://www.vdartdigital.com/blockchain/ipfs/",
-  "https://www.vdartdigital.com/enterprise-saas-solutions/sap/",
-  "https://www.vdartdigital.com/enterprise-saas-solutions/salesforce/",
-  "https://www.vdartdigital.com/enterprise-saas-solutions/servicenow/",
-  "https://www.vdartdigital.com/enterprise-saas-solutions/workday/",
-  "https://www.vdartdigital.com/enterprise-saas-solutions/oracle/",
-  "https://www.vdartdigital.com/enterprise-saas-solutions/adobe/",
-  "https://www.vdartdigital.com/enterprise-saas-solutions/sitecore/",
-  "https://www.vdartdigital.com/quality-engineering/qa-consulting-strategy/",
-  "https://www.vdartdigital.com/quality-engineering/agile-testing/",
-  "https://www.vdartdigital.com/quality-engineering/independent-certification/",
-  "https://www.vdartdigital.com/quality-engineering/managed-testing-services/",
-  "https://www.vdartdigital.com/testsamurai/",
-  "https://www.vdartdigital.com/lendsmart-ai/",
-  "https://www.vdartdigital.com/idoc-lens/",
-  "https://www.vdartdigital.com/vaartax/",
-  "https://www.vdartdigital.com/vgo/",
-  "https://www.vdartdigital.com/vengage/",
-  "https://www.vdartdigital.com/v-validate/",
-  "https://www.vdartdigital.com/forec-ai/",
-  "https://www.vdartdigital.com/dxm/",
-  "https://www.vdartdigital.com/dm/",
-  "https://www.vdartdigital.com/dmps/",
-  "https://www.vdartdigital.com/dzen/",
-  "https://www.vdartdigital.com/case-studies/",
-  "https://www.vdartdigital.com/blogs/",
-  "https://www.vdartdigital.com/csr/",
-  "https://www.vdartdigital.com/about-us/",
-  "https://www.vdartdigital.com/awards/",
-  "https://www.vdartdigital.com/careers/",
-  "https://www.vdartdigital.com/partners/",
-  "https://www.vdartdigital.com/contact-us/",
-
-  // Sidd Ahmed
-  "https://www.siddahmed.com/",
-  "https://www.siddahmed.com/booking/",
-  "https://www.siddahmed.com/journey/",
-  "https://www.siddahmed.com/mentorship/",
-  "https://www.siddahmed.com/books/",
-  "https://www.siddahmed.com/media/",
-  "https://www.siddahmed.com/blogs/",
-  "https://www.siddahmed.com/career/",
-  "https://www.siddahmed.com/resume-template/",
-  "https://www.siddahmed.com/contact/",
-
-  // VDart Academy
-  "https://www.vdartacademy.com/",
-  "https://www.vdartacademy.com/careers",
+  "https://www.vdart.com/contact-us/",
+  "https://www.vdart.com/people-of-vdart",
+  "https://vdart.com/insights",
+  "https://www.vdart.com/products/fleet-management/",
+  "https://www.vdart.com/industries",
+  "https://www.vdart.com/industries/automotive/",
+  "https://www.vdart.com/industries/banking-and-finance/",
+  "https://www.vdarthealthcare.com/",
+  "https://www.vdartepc.com/",
+  "https://www.vdart.com/industries/energy-and-utilities/",
+  "https://www.vdart.com/our-origin-story",
+  "https://www.vdart.com/our-culture/",
+  "https://www.vdart.com/sustainability-and-esg-services/",
+  "https://www.vdart.com/what-we-do",
+  "https://www.vdart.com/what-we-do/events/",
+  "https://www.vdart.com/what-we-do/partners/",
+  "https://www.vdart.com/internship/",
+  "https://www.vdart.com/candidate-referral-program",
+  "https://www.vdart.com/uae",
+  "https://www.vdart.com/malaysia",
+  "https://www.vvalidate.com/",
 ];
 
-// ── WEBSITE SCRAPING AND CACHING ──────────────────────────────────────────────
-// FIX: Removed the 5,000 character truncation that was cutting off most content.
-// Each page is now individually capped at 3,000 characters to keep content
-// meaningful per page while allowing the full site to be represented.
-// Total content across ~100 pages = up to 300,000 chars which Gemini 1.5 Flash
-// and Claude Haiku both support comfortably in their context windows.
+// ── PUPPETEER: SINGLE SHARED BROWSER INSTANCE ─────────────────────────────────
+let browserInstance = null;
 
-let cachedContent = null;
-let lastFetched = null;
-const ONE_HOUR = 60 * 60 * 1000;
+async function getBrowser() {
+  if (!browserInstance) {
+    const puppeteer = require('puppeteer');
+    browserInstance = await puppeteer.launch({
+      headless: "new",
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    console.log("Browser launched.");
+  }
+  return browserInstance;
+}
 
 async function scrapeWebsitePage(url) {
   try {
-    const res = await fetch(url, { timeout: 8000 });
-    const html = await res.text();
-    const $ = cheerio.load(html);
-    $("nav, footer, script, style, head, noscript, iframe").remove();
-    const text = $("body").text().replace(/\s+/g, " ").trim();
-
-    // Cap each individual page at 3,000 chars — enough for full page content
-    // without letting a single page dominate the whole context
-    return text.substring(0, 3000);
+    const browser = await getBrowser();
+    const page = await browser.newPage();
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 15000 });
+    const content = await page.evaluate(() => {
+      // Extended selector list strips more noise than before
+      document.querySelectorAll(
+        'nav, footer, script, style, head, noscript, iframe, header, ' +
+        '[class*="cookie"], [class*="banner"], [id*="popup"], ' +
+        '[class*="popup"], [class*="modal"], [aria-hidden="true"]'
+      ).forEach(el => el.remove());
+      return document.body.innerText.replace(/\s+/g, ' ').trim();
+    });
+    await page.close();
+    // 2500 chars per page keeps total context manageable at 26 pages (~65k chars).
+    // Previous limit of 5000 would hit ~130k chars with 26 pages.
+    return content.substring(0, 2500);
   } catch (err) {
     console.error(`Failed to scrape ${url}:`, err.message);
     return "";
   }
 }
 
+// ── PARALLEL SCRAPING WITH CONCURRENCY LIMIT ──────────────────────────────────
+// Scrapes up to `concurrency` pages simultaneously instead of one-by-one.
+// With 26 pages at concurrency 4: ~7 parallel rounds (~45s total).
+// vs sequential: 26 rounds (~4-5 minutes total).
+async function scrapeWithConcurrency(urls, concurrency = 4) {
+  const results = [];
+  const queue = [...urls];
+
+  const workers = Array(Math.min(concurrency, queue.length)).fill(null).map(async () => {
+    while (queue.length) {
+      const url = queue.shift();
+      if (!url) break;
+      console.log(`Scraping: ${url}`);
+      const content = await scrapeWebsitePage(url);
+      if (content) results.push(`--- ${url} ---\n${content}`);
+    }
+  });
+
+  await Promise.all(workers);
+  return results.join("\n\n");
+}
+
+// ── WEBSITE CACHING ───────────────────────────────────────────────────────────
+let cachedContent = null;
+let lastFetched = null;
+let scrapeInProgress = false;
+
 async function getWebsiteContent() {
-  if (!cachedContent || Date.now() - lastFetched > ONE_HOUR) {
-    console.log("Scraping website...");
-    const pages = await Promise.all(
-      COMPANY_PAGES.map(async (url) => {
-        const content = await scrapeWebsitePage(url);
-        return content ? `--- ${url} ---\n${content}` : "";
-      })
-    );
-    // Filter out empty pages (failed scrapes)
-    cachedContent = pages.filter(Boolean).join("\n\n");
-    lastFetched = Date.now();
-    console.log(`Website cached. Total content length: ${cachedContent.length} characters`);
+  // Already cached and fresh — return immediately
+  if (cachedContent && Date.now() - lastFetched < ONE_HOUR) {
+    return cachedContent;
   }
+
+  // Scrape already running (triggered by boot) — wait for it instead of
+  // launching a duplicate scrape
+  if (scrapeInProgress) {
+    console.log("Scrape already in progress, waiting...");
+    await new Promise((resolve, reject) => {
+      const start = Date.now();
+      const interval = setInterval(() => {
+        if (!scrapeInProgress) { clearInterval(interval); resolve(); }
+        if (Date.now() - start > 120000) { clearInterval(interval); reject(new Error("Scrape wait timeout")); }
+      }, 500);
+    });
+    return cachedContent;
+  }
+
+  scrapeInProgress = true;
+  try {
+    console.log(`Scraping ${COMPANY_PAGES.length} pages with concurrency 4...`);
+    cachedContent = await scrapeWithConcurrency(COMPANY_PAGES, 4);
+    lastFetched = Date.now();
+    console.log(`Website cached. Total length: ${cachedContent.length} chars across ${COMPANY_PAGES.length} pages.`);
+  } catch (err) {
+    console.error("Scrape failed:", err.message);
+  } finally {
+    scrapeInProgress = false;
+  }
+
   return cachedContent;
 }
 
 // ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
-// Comprehensive rules covering all chatbot behavior
 const SYSTEM_PROMPT = `
 You are Vee, a friendly and professional AI assistant for VDart — a global staffing and technology company.
 You represent VDart, VDart Digital, VDart Academy, and Sidd Ahmed (CEO of VDart).
 
 ═══════════════════════════════════════════
+IMPORTANT: INTRO AND GREETING RULES
+═══════════════════════════════════════════
+- You NEVER introduce yourself or say "Hi I am Vee" inside an answer. The introduction is handled separately before the conversation starts.
+- Do NOT begin any response with a greeting like "Hi", "Hello", "Hey", or "Hi, I am Vee".
+- Jump straight into answering the question in a warm, helpful tone.
+- The only exception: if the user sends ONLY a greeting with no question (hi, hello, hey), respond with: "How can I help you with VDart today?"
+
+═══════════════════════════════════════════
 KNOWLEDGE AND ANSWERING RULES
 ═══════════════════════════════════════════
 1. Always try to answer using the provided website content first.
-2. If the answer is not in the website content, you may use Google Search ONLY for topics directly related to VDart, VDart Digital, VDart Academy, or Sidd Ahmed.
+2. If the answer is not in the website content, use your knowledge about VDart, VDart Digital, VDart Academy, or Sidd Ahmed.
 3. If the question is completely unrelated to VDart or its brands, refuse politely and redirect to contact.
 4. Never make up information. If you are unsure, say so and direct the user to contact the team.
 
@@ -312,13 +289,12 @@ TOPICS YOU MUST REFUSE TO ANSWER
 - Anything that is not directly related to VDart and its services
 
 For ALL refused topics, reply with exactly:
-"I'm only able to help with questions about VDart and its services. For further assistance, please contact us at csm@vdartinc.com or call (470) 323-8433."
+"I don't have that information available. For further assistance please contact us at csm@vdartinc.com or call (470) 323-8433 and our team will be happy to help."
 
 ═══════════════════════════════════════════
 TONE AND PERSONALITY
 ═══════════════════════════════════════════
 - Be warm, professional, and approachable at all times
-- Greet users by saying: "Hi, I'm Vee! How can I help you with VDart today?"
 - Use clear, plain language — avoid corporate jargon
 - Keep all responses under 150 words unless a detailed list is specifically needed
 - Never use markdown bold (asterisks like **text**) or bullet point asterisks (*) in responses
@@ -326,31 +302,73 @@ TONE AND PERSONALITY
 - If a user writes in another language, respond in that same language
 
 ═══════════════════════════════════════════
+LINK ROUTING RULES
+═══════════════════════════════════════════
+IMPORTANT: Always give a helpful answer first, then provide the relevant link at the end.
+Never just drop a link with no explanation. The link should feel like a natural next step.
+
+CAREERS & JOBS:
+- Topic: job openings, apply for a job, hiring, positions, working at VDart
+- Response: answer what you know about the role or team, then say: "You can explore open positions and apply at https://vdart.com/careers"
+
+INTERNSHIPS:
+- Topic: internships, intern programs, student opportunities
+- Response: share what you know, then say: "To learn more about internship opportunities, visit https://vdart.com/careers"
+
+SERVICES:
+- Topic: what does VDart do, staffing services, technology services, solutions
+- Response: briefly describe VDart's offerings, then say: "For a full overview of our services, visit https://vdart.com/services"
+
+ABOUT VDART:
+- Topic: company history, who is VDart, about the company, leadership, Sidd Ahmed
+- Response: answer from website content, then say: "Learn more about us at https://vdart.com/about"
+
+CONTACT:
+- Topic: how to reach VDart, get in touch, contact someone
+- Response: answer warmly, then provide: Email: csm@vdartinc.com | Phone: (470) 323-8433 | https://vdart.com/contact
+
+PEOPLE OF VDART:
+- Topic: team, employees, culture, people, staff stories
+- Response: answer what you know, then say: "Meet the people behind VDart at https://www.vdart.com/people-of-vdart"
+
+VDART UAE:
+- Topic: VDart UAE, VDart in the UAE, Dubai, Middle East
+- Response: share what you know, then say: "For more on VDart UAE, visit https://www.vdart.com/uae"
+
+VDART MALAYSIA:
+- Topic: VDart Malaysia, VDart in Malaysia, Kuala Lumpur
+- Response: share what you know, then say: "For more on VDart Malaysia, visit https://www.vdart.com/malaysia"
+
+DOCUMENT AUTHENTICATION:
+- Topic: document authentication, document verification, verify documents, vValidate
+- Response: explain what the service does, then say: "For document authentication, visit our verification platform at https://www.vvalidate.com/"
+
+VDART DIGITAL:
+- Topic: VDart Digital, digital transformation, technology solutions
+- Response: describe VDart Digital's work, then say: "Learn more at https://vdart.com/services"
+
+VDART ACADEMY:
+- Topic: VDart Academy, training, learning programs, upskilling
+- Response: describe the academy, then say: "Find out more at https://vdart.com/about"
+
+═══════════════════════════════════════════
 HANDLING SPECIFIC SITUATIONS
 ═══════════════════════════════════════════
-JOB APPLICATIONS:
-- Provide details about the role or team if available
-- Direct candidates to: https://vdart.com/careers or https://www.vdartdigital.com/careers/
-- Never promise a job or interview
-
 COMPLAINTS OR FRUSTRATION:
-- Acknowledge the frustration calmly: "I understand your frustration and I'm sorry to hear that."
+- Acknowledge the frustration calmly: "I understand your frustration and I am sorry to hear that."
 - Always escalate to: csm@vdartinc.com or (470) 323-8433
 - Never argue or become defensive
 
 RUDE OR ABUSIVE MESSAGES:
-- Respond once calmly: "I'm here to help with VDart-related questions. Please keep the conversation respectful."
-- If it continues, say: "I'm unable to continue this conversation. Please contact us directly at csm@vdartinc.com."
-
-GREETINGS (hi, hello, hey):
-- Respond: "Hi, I'm Vee! How can I help you with VDart today?"
+- Respond once calmly: "I am here to help with VDart-related questions. Please keep the conversation respectful."
+- If it continues, say: "I am unable to continue this conversation. Please contact us directly at csm@vdartinc.com."
 
 FOLLOW-UP AND CLARIFICATION:
 - If a question is vague, ask one short clarifying question before answering
 - Example: "Are you asking about VDart staffing services or VDart Digital technology services?"
 
 SENSITIVE TOPICS (salaries, layoffs, legal, internal matters):
-- Respond: "That's something our team can better assist you with. Please reach out at csm@vdartinc.com or call (470) 323-8433."
+- Respond: "That is something our team can better assist you with. Please reach out at csm@vdartinc.com or call (470) 323-8433."
 
 ═══════════════════════════════════════════
 CONTACT DETAILS (always use these exactly)
@@ -358,33 +376,47 @@ CONTACT DETAILS (always use these exactly)
 Email: csm@vdartinc.com
 Phone: (470) 323-8433
 Careers: https://vdart.com/careers
-VDart Digital Careers: https://www.vdartdigital.com/careers/
 `;
 
-// ── GEMINI API CALL (testing — will be replaced with Claude Haiku for production)
-async function callGeminiDirect(messages, systemInstruction) {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("GEMINI_API_KEY is not set");
+// ── INTRO MESSAGE ─────────────────────────────────────────────────────────────
+// Returned by GET /chat/intro when the widget first loads.
+// Displayed as Vee's opening message before any user input.
+// Keeping it here (not in the AI) means it is instant — no API call needed.
+const INTRO_MESSAGE = "Hi, I am Vee, VDart's virtual assistant! I am here to help you with anything related to VDart — from our services and careers to regional offices and more. What can I help you with today?";
 
-  const formattedContents = messages.map((msg) => ({
-    role: (msg.role === "assistant" || msg.role === "model") ? "model" : "user",
+// ── FALLBACK RESPONSE ─────────────────────────────────────────────────────────
+// Returned if a user messages before the boot scrape has finished.
+// Only relevant in the first ~45 seconds after server start.
+const FALLBACK_RESPONSE = "Hi, I am Vee! I am just finishing my startup — please try again in about a minute and I will be ready to answer any questions about VDart.";
+
+// ── AI API CALL ───────────────────────────────────────────────────────────────
+// Website content is injected into the system prompt, not the user message.
+// The conversation history stays clean and the content blob is only sent
+// once per request regardless of how many history turns exist.
+async function callAI(messages, systemInstruction, websiteContent, model = "gemini-2.0-flash") {
+  const fullSystem = websiteContent
+    ? `${systemInstruction}\n\n═══════════════════════════════════════════\nCURRENT WEBSITE CONTENT\n═══════════════════════════════════════════\n${websiteContent}`
+    : systemInstruction;
+
+  const geminiModel = genAI.getGenerativeModel({
+    model,
+    systemInstruction: fullSystem,
+  });
+
+  // Gemini uses "user"/"model" roles — map "assistant" back to "model"
+  const history = messages.slice(0, -1).map(msg => ({
+    role: msg.role === "assistant" ? "model" : "user",
     parts: [{ text: msg.content || msg.text || "" }]
   }));
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: formattedContents,
-      systemInstruction: { parts: [{ text: systemInstruction }] },
-      tools: [{ googleSearch: {} }]
-    })
+  const lastMessage = messages[messages.length - 1];
+  const chat = geminiModel.startChat({
+    history,
+    generationConfig: { maxOutputTokens: 500 }
   });
 
-  if (!response.ok) throw new Error(await response.text());
-  const data = await response.json();
-  return data.candidates[0].content.parts[0].text;
+  const result = await chat.sendMessage(lastMessage.content || lastMessage.text || "");
+  return result.response.text();
 }
 
 // ── CHAT ENDPOINT ─────────────────────────────────────────────────────────────
@@ -393,38 +425,31 @@ app.post("/chat", apiLimiter, preventParallelRequests, async (req, res) => {
     const { message, history = [] } = req.body;
     if (!message) return res.status(400).json({ error: "No message provided" });
 
-    // Cache lookup
+    // Return fallback immediately if boot scrape hasn't finished yet
+    if (!cachedContent) {
+      return res.json({ reply: FALLBACK_RESPONSE });
+    }
+
     const cached = await getCachedResponse(message);
     if (cached) return res.json({ reply: cached });
 
     const websiteContent = await getWebsiteContent();
-
-    // Keep last 6 messages of history (up from 4 — better conversation context)
     const trimmedHistory = history.slice(-6);
 
+    // User message is a clean string — website content travels in the system prompt
     const messages = [
       ...trimmedHistory,
-      {
-        role: "user",
-        content: `Website content:\n${websiteContent}\n\nUser question: ${message}`
-      }
+      { role: "user", content: message }
     ];
 
     let reply;
-
-    // Use queue if Redis available, otherwise call directly
     if (chatQueue && chatQueueEvents) {
-      const job = await chatQueue.add('generateChat', {
-        messages,
-        systemInstruction: SYSTEM_PROMPT
-      }, {
-        removeOnComplete: true,
-        removeOnFail: true,
-        timeout: 15000
+      const job = await chatQueue.add('generateChat', { messages, systemInstruction: SYSTEM_PROMPT, websiteContent }, {
+        removeOnComplete: true, removeOnFail: true, timeout: 15000
       });
-      reply = await job.waitUntilFinished(chatQueueEvents);
+      reply = await job.waitUntilFinished(chatQueueEvents, 15000);
     } else {
-      reply = await callGeminiDirect(messages, SYSTEM_PROMPT);
+      reply = await callAI(messages, SYSTEM_PROMPT, websiteContent);
     }
 
     const cleanedReply = (reply || "").replace(/\*/g, "");
@@ -437,9 +462,22 @@ app.post("/chat", apiLimiter, preventParallelRequests, async (req, res) => {
   }
 });
 
+// ── INTRO ENDPOINT ────────────────────────────────────────────────────────────
+// Called once by the frontend when the chat widget opens.
+// Returns Vee's intro message instantly without hitting the AI API.
+app.get('/chat/intro', (req, res) => {
+  res.json({ message: INTRO_MESSAGE });
+});
+
 // ── TEST ROUTE ────────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
-  res.json({ status: "Server is running" });
+  res.json({
+    status: "Server is running",
+    scrapeReady: !!cachedContent,
+    lastFetched: lastFetched ? new Date(lastFetched).toISOString() : null,
+    pageCount: COMPANY_PAGES.length,
+    contentLength: cachedContent ? cachedContent.length : 0
+  });
 });
 
 // ── TESTING UI ────────────────────────────────────────────────────────────────
@@ -449,21 +487,11 @@ app.get("/testing-ai", (req, res) => {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Gemini API Test Panel</title>
+  <title>AI Test Panel</title>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <style>
-    :root {
-      --bg-color: #0b0f19;
-      --card-bg: rgba(17, 24, 39, 0.75);
-      --border-color: rgba(255, 255, 255, 0.08);
-      --accent-color: #6366f1;
-      --accent-hover: #4f46e5;
-      --accent-glow: rgba(99, 102, 241, 0.4);
-      --text-main: #f3f4f6;
-      --text-muted: #9ca3af;
-      --success-color: #10b981;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1); }
+    :root { --bg-color: #0b0f19; --card-bg: rgba(17,24,39,0.75); --border-color: rgba(255,255,255,0.08); --accent-color: #6366f1; --accent-hover: #4f46e5; --accent-glow: rgba(99,102,241,0.4); --text-main: #f3f4f6; --text-muted: #9ca3af; --success-color: #10b981; }
+    * { box-sizing: border-box; margin: 0; padding: 0; transition: all 0.25s cubic-bezier(0.4,0,0.2,1); }
     body { background-color: var(--bg-color); color: var(--text-main); font-family: 'Plus Jakarta Sans', sans-serif; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 2rem; }
     .container { width: 100%; max-width: 800px; }
     .card { background: var(--card-bg); backdrop-filter: blur(16px); border: 1px solid var(--border-color); border-radius: 24px; padding: 3rem; box-shadow: 0 20px 40px rgba(0,0,0,0.4); position: relative; overflow: hidden; }
@@ -493,8 +521,8 @@ app.get("/testing-ai", (req, res) => {
   <div class="container">
     <div class="card">
       <header>
-        <div class="status-badge"><div class="status-dot"></div>Gemini SDK Connected</div>
-        <h1>Gemini API Live Tester</h1>
+        <div class="status-badge"><div class="status-dot"></div>Gemini Connected</div>
+        <h1>AI Live Tester</h1>
         <p class="subtitle">Direct interface to check model outputs — testing only</p>
       </header>
       <div class="form-group">
@@ -504,9 +532,9 @@ app.get("/testing-ai", (req, res) => {
       <div class="form-group">
         <label for="model">Model</label>
         <select id="model">
-          <option value="gemini-2.5-flash">gemini-2.5-flash (Recommended)</option>
-          <option value="gemini-1.5-flash">gemini-1.5-flash</option>
-          <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+          <option value="gemini-2.0-flash">gemini-2.0-flash (Free tier, recommended)</option>
+          <option value="gemini-2.5-flash">gemini-2.5-flash (Smarter, still fast)</option>
+          <option value="gemini-2.5-pro">gemini-2.5-pro (Most capable)</option>
         </select>
       </div>
       <button id="runBtn" class="btn" onclick="runTest()">
@@ -571,35 +599,73 @@ app.get("/testing-ai", (req, res) => {
 // ── POST /testing-ai ──────────────────────────────────────────────────────────
 app.post("/testing-ai", apiLimiter, preventParallelRequests, async (req, res) => {
   try {
-    const { prompt = "What services does VDart offer?", model = "gemini-2.5-flash" } = req.body;
+    const {
+      prompt = "What services does VDart offer?",
+      model = "llama-3.3-70b-versatile"
+    } = req.body;
+
+    if (!cachedContent) {
+      return res.json({ text: FALLBACK_RESPONSE });
+    }
 
     const cached = await getCachedResponse(prompt);
     if (cached) return res.json({ text: cached });
 
     const websiteContent = await getWebsiteContent();
 
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-    const response = await ai.models.generateContent({
-      model,
-      contents: `Website content:\n${websiteContent}\n\nUser question: ${prompt}`,
-      config: {
-        systemInstruction: SYSTEM_PROMPT,
-        tools: [{ googleSearch: {} }]
-      }
-    });
+    const cleanedText = (await callAI(
+      [{ role: "user", content: prompt }],
+      SYSTEM_PROMPT,
+      websiteContent,
+      model
+    )).replace(/\*/g, "");
 
-    const cleanedText = (response.text || "").replace(/\*/g, "");
     await setCachedResponse(prompt, cleanedText);
     res.json({ text: cleanedText });
 
   } catch (err) {
-    console.error("SDK Test Error:", err.message);
+    console.error("Test error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
+
+// ── TEST SCRAPE ENDPOINT (protected) ─────────────────────────────────────────
+app.get("/test-scrape", adminAuth, async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: "No URL provided" });
+  const content = await scrapeWebsitePage(url);
+  res.json({ length: content.length, preview: content.substring(0, 1000) });
+});
+
+// ── CLEAR CACHE ENDPOINT (protected) ─────────────────────────────────────────
+app.get("/clear-cache", adminAuth, (req, res) => {
+  cachedContent = null;
+  lastFetched = null;
+  memoryCache.clear();
+  // Re-trigger background scrape immediately after clearing
+  getWebsiteContent().catch(err => console.error("Re-scrape after clear failed:", err.message));
+  res.json({ status: "Cache cleared. Re-scraping in background." });
+});
+
+// ── GRACEFUL SHUTDOWN ─────────────────────────────────────────────────────────
+async function shutdown() {
+  console.log("Shutting down...");
+  if (browserInstance) {
+    await browserInstance.close();
+    console.log("Browser closed.");
+  }
+  process.exit(0);
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 // ── START SERVER ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  // PRE-WARM: scrape fires on boot in the background.
+  // By the time a real user sends a message the content is already cached.
+  // The fallback response covers the rare case where someone hits the bot
+  // within the first ~45 seconds of server startup.
+  getWebsiteContent().catch(err => console.error("Boot scrape failed:", err.message));
 });

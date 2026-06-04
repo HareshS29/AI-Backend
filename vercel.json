@@ -1,15 +1,6 @@
 {
-  "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/$1" }
-  ],
-  "crons": [
-    {
-      "path": "/api/scrape?token=YOUR_ADMIN_TOKEN",
-      "schedule": "0 * * * *"
-    }
-  ],
-  "functions": {
-    "api/scrape.js": { "maxDuration": 60 },
-    "api/chat.js": { "maxDuration": 30 }
+    "rewrites": [
+      { "source": "/(.*)", "destination": "/" }
+    ]
   }
-}
+  
